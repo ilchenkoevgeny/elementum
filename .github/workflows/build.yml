@@ -1,9 +1,10 @@
 name: build
 
 on:
+  workflow_dispatch:
   push:
     branches:
-      - '*'
+      - '**'
     tags:
       - v*
   pull_request:
@@ -140,4 +141,3 @@ jobs:
                 binaries_branch: context.refName
               }
             });
-            
