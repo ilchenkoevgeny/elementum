@@ -54,7 +54,6 @@ jobs:
           GO_GCFLAGS: github.com/ElementumOrg/libtorrent-go=-lang=go1.17
         run: | 
           make ${{ matrix.platform }} 
-          make ${{ matrix.platform }}-shared
 
       - name: Generate ${{ matrix.platform }} zip
         id: generate_zip
