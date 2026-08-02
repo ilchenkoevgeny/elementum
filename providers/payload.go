@@ -8,11 +8,13 @@ import (
 
 // SearchPayload ...
 type SearchPayload struct {
-	Method           string      `json:"method"`
-	CallbackURL      string      `json:"callback_url"`
-	CallbackLogin    string      `json:"callback_login"`
-	CallbackPassword string      `json:"callback_password"`
-	SearchObject     interface{} `json:"search_object"`
+	Method             string      `json:"method"`
+	CallbackURL        string      `json:"callback_url"`
+	CallbackLogin      string      `json:"callback_login"`
+	CallbackPassword   string      `json:"callback_password"`
+	Progressive        bool        `json:"progressive,omitempty"`
+	ProgressiveTimeout int         `json:"progressive_timeout,omitempty"`
+	SearchObject       interface{} `json:"search_object"`
 }
 
 // GeneralSearchObject ...

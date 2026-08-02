@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/anacrolix/missinggo/perf"
 	"github.com/anacrolix/sync"
@@ -580,6 +581,136 @@ func movieLinks(xbmcHost *xbmc.XBMCHost, callbackHost string, tmdbID string) []*
 	return providers.SearchMovie(xbmcHost, searchers, movie)
 }
 
+func movieLinksProgressive(xbmcHost *xbmc.XBMCHost, callbackHost string, movie *tmdb.Movie) <-chan []*bittorrent.TorrentFile {
+	searchers := providers.GetMovieSearchers(xbmcHost, callbackHost)
+	if len(searchers) == 0 {
+		empty := make(chan []*bittorrent.TorrentFile)
+		close(empty)
+		return empty
+	}
+
+	return providers.SearchMovieProgressive(xbmcHost, searchers, movie)
+}
+
+func movieTorrentChoices(torrents []*bittorrent.TorrentFile) []string {
+	choices := make([]string, 0, len(torrents))
+	for _, torrent := range torrents {
+		resolution := ""
+		if torrent.Resolution > 0 {
+			resolution = fmt.Sprintf("[B]%s[/B] ", util.ApplyColor(bittorrent.Resolutions[torrent.Resolution], bittorrent.Colors[torrent.Resolution]))
+		}
+
+		info := make([]string, 0)
+		if torrent.Size != "" {
+			info = append(info, fmt.Sprintf("[B][%s][/B]", torrent.Size))
+		}
+		if torrent.RipType > 0 {
+			info = append(info, bittorrent.Rips[torrent.RipType])
+		}
+		if torrent.VideoCodec > 0 {
+			info = append(info, bittorrent.Codecs[torrent.VideoCodec])
+		}
+		if torrent.AudioCodec > 0 {
+			info = append(info, bittorrent.Codecs[torrent.AudioCodec])
+		}
+		if torrent.Provider != "" {
+			info = append(info, fmt.Sprintf(" - [B]%s[/B]", torrent.Provider))
+		}
+
+		multi := ""
+		if torrent.Multi {
+			multi = multiType
+		}
+
+		choices = append(choices, fmt.Sprintf("%s(%d / %d) %s\n%s\n%s%s",
+			resolution,
+			torrent.Seeds,
+			torrent.Peers,
+			strings.Join(info, " "),
+			torrent.Name,
+			torrent.Icon,
+			multi,
+		))
+	}
+	return choices
+}
+
+func selectProgressiveMovie(xbmcHost *xbmc.XBMCHost, title string, updates <-chan []*bittorrent.TorrentFile) ([]*bittorrent.TorrentFile, int) {
+	var dialog *xbmc.DialogSelectLargeProgressive
+	var torrents []*bittorrent.TorrentFile
+	choicesByValue := make(map[string]*bittorrent.TorrentFile)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case snapshot, ok := <-updates:
+			if !ok {
+				updates = nil
+				if dialog == nil {
+					return torrents, -1
+				}
+				continue
+			}
+
+			torrents = snapshot
+			choices := movieTorrentChoices(torrents)
+			for index, value := range choices {
+				choicesByValue[value] = torrents[index]
+			}
+
+			if dialog == nil {
+				dialog = xbmcHost.NewDialogSelectLargeProgressive(
+					"LOCALIZE[30228]",
+					title,
+					choices...,
+				)
+				if dialog == nil {
+					continue
+				}
+			} else {
+				dialog.Update(choices...)
+			}
+
+		case <-ticker.C:
+			if dialog == nil {
+				if updates == nil {
+					return torrents, -1
+				}
+				continue
+			}
+
+			result := dialog.Result()
+			if !result.Done {
+				continue
+			}
+
+			dialog.Close()
+			if updates != nil {
+				go func() {
+					for range updates {
+					}
+				}()
+			}
+
+			selected := choicesByValue[result.Value]
+			if selected == nil && result.Choice >= 0 && result.Choice < len(torrents) {
+				selected = torrents[result.Choice]
+			}
+			if selected == nil {
+				return torrents, -1
+			}
+
+			for index, torrent := range torrents {
+				if torrent == selected || (torrent.InfoHash == selected.InfoHash && torrent.Provider == selected.Provider) {
+					return torrents, index
+				}
+			}
+			return torrents, -1
+		}
+	}
+}
+
 // MovieRun ...
 func MovieRun(action string, s *bittorrent.Service) gin.HandlerFunc {
 	defer perf.ScopeTimer()()
@@ -641,9 +772,18 @@ func MovieLinks(action string, s *bittorrent.Service) gin.HandlerFunc {
 
 		var torrents []*bittorrent.TorrentFile
 		var err error
+		choice := -1
+		usedProgressiveDialog := false
 
 		if torrents, err = GetCachedTorrents(tmdbID); err != nil || len(torrents) == 0 {
-			if !isCustom {
+			if !isCustom && action != "play" {
+				usedProgressiveDialog = true
+				torrents, choice = selectProgressiveMovie(
+					xbmcHost,
+					movie.GetSearchTitle(),
+					movieLinksProgressive(xbmcHost, ctx.Request.Host, movie),
+				)
+			} else if !isCustom {
 				torrents = movieLinks(xbmcHost, ctx.Request.Host, tmdbID)
 			} else {
 				if query := xbmcHost.Keyboard(movie.GetTitle(), "LOCALIZE[30209]"); len(query) != 0 {
@@ -659,52 +799,13 @@ func MovieLinks(action string, s *bittorrent.Service) gin.HandlerFunc {
 			return
 		}
 
-		choices := make([]string, 0, len(torrents))
-		for _, torrent := range torrents {
-			resolution := ""
-			if torrent.Resolution > 0 {
-				resolution = fmt.Sprintf("[B]%s[/B] ", util.ApplyColor(bittorrent.Resolutions[torrent.Resolution], bittorrent.Colors[torrent.Resolution]))
+		if !usedProgressiveDialog {
+			if action == "play" {
+				choice = 0
+			} else {
+				choices := movieTorrentChoices(torrents)
+				choice = xbmcHost.ListDialogLarge("LOCALIZE[30228]", movie.GetSearchTitle(), choices...)
 			}
-
-			info := make([]string, 0)
-			if torrent.Size != "" {
-				info = append(info, fmt.Sprintf("[B][%s][/B]", torrent.Size))
-			}
-			if torrent.RipType > 0 {
-				info = append(info, bittorrent.Rips[torrent.RipType])
-			}
-			if torrent.VideoCodec > 0 {
-				info = append(info, bittorrent.Codecs[torrent.VideoCodec])
-			}
-			if torrent.AudioCodec > 0 {
-				info = append(info, bittorrent.Codecs[torrent.AudioCodec])
-			}
-			if torrent.Provider != "" {
-				info = append(info, fmt.Sprintf(" - [B]%s[/B]", torrent.Provider))
-			}
-
-			multi := ""
-			if torrent.Multi {
-				multi = multiType
-			}
-
-			label := fmt.Sprintf("%s(%d / %d) %s\n%s\n%s%s",
-				resolution,
-				torrent.Seeds,
-				torrent.Peers,
-				strings.Join(info, " "),
-				torrent.Name,
-				torrent.Icon,
-				multi,
-			)
-			choices = append(choices, label)
-		}
-
-		choice := -1
-		if action == "play" {
-			choice = 0
-		} else {
-			choice = xbmcHost.ListDialogLarge("LOCALIZE[30228]", movie.GetSearchTitle(), choices...)
 		}
 
 		if choice >= 0 {

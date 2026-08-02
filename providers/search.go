@@ -94,6 +94,109 @@ func SearchMovie(xbmcHost *xbmc.XBMCHost, searchers []MovieSearcher, movie *tmdb
 	return processLinks(xbmcHost, torrentsChan, SortMovies, false)
 }
 
+// SearchMovieProgressive resolves and emits a complete, seed-sorted snapshot
+// whenever a provider returns another batch.
+func SearchMovieProgressive(xbmcHost *xbmc.XBMCHost, searchers []MovieSearcher, movie *tmdb.Movie) <-chan []*bittorrent.TorrentFile {
+	updates := make(chan []*bittorrent.TorrentFile, 8)
+	rawBatches := make(chan []*bittorrent.TorrentFile, 8)
+
+	go func() {
+		wg := sync.WaitGroup{}
+		for _, searcher := range searchers {
+			wg.Add(1)
+			go func(searcher MovieSearcher) {
+				defer wg.Done()
+				if progressive, ok := searcher.(*AddonSearcher); ok {
+					for batch := range progressive.SearchMovieLinksProgressive(movie) {
+						if len(batch) > 0 {
+							rawBatches <- batch
+						}
+					}
+					return
+				}
+
+				if batch := searcher.SearchMovieLinks(movie); len(batch) > 0 {
+					rawBatches <- batch
+				}
+			}(searcher)
+		}
+		wg.Wait()
+		close(rawBatches)
+	}()
+
+	go func() {
+		defer close(updates)
+		accumulated := make([]*bittorrent.TorrentFile, 0)
+
+		for batch := range rawBatches {
+			batchChan := make(chan *bittorrent.TorrentFile, len(batch))
+			for _, torrent := range batch {
+				batchChan <- torrent
+			}
+			close(batchChan)
+
+			resolved := processLinks(xbmcHost, batchChan, SortMovies, true)
+			accumulated = mergeProgressiveResults(accumulated, resolved)
+			if len(accumulated) > 0 {
+				snapshot := append([]*bittorrent.TorrentFile(nil), accumulated...)
+				updates <- snapshot
+			}
+		}
+	}()
+
+	return updates
+}
+
+func mergeProgressiveResults(existing, incoming []*bittorrent.TorrentFile) []*bittorrent.TorrentFile {
+	merged := make(map[string]*bittorrent.TorrentFile, len(existing)+len(incoming))
+	for _, torrent := range append(existing, incoming...) {
+		if torrent == nil || torrent.InfoHash == "" {
+			continue
+		}
+
+		key := torrent.InfoHash
+		if torrent.IsPrivate {
+			key += "-" + torrent.Provider
+		}
+
+		current, ok := merged[key]
+		if !ok {
+			merged[key] = torrent
+			continue
+		}
+
+		for _, trackerURL := range torrent.Trackers {
+			if !util.StringSliceContains(current.Trackers, trackerURL) {
+				current.Trackers = append(current.Trackers, trackerURL)
+			}
+		}
+		if !strings.Contains(current.Provider, torrent.Provider) {
+			current.Provider += ", " + torrent.Provider
+		}
+		if torrent.Resolution > current.Resolution {
+			current.Name = torrent.Name
+			current.Resolution = torrent.Resolution
+		}
+		if current.IsMagnet() && !torrent.IsMagnet() {
+			current.URI = torrent.URI
+		}
+		if torrent.Seeds > current.Seeds {
+			current.Seeds = torrent.Seeds
+			current.Peers = torrent.Peers
+		}
+		current.Multi = true
+	}
+
+	results := make([]*bittorrent.TorrentFile, 0, len(merged))
+	for _, torrent := range merged {
+		results = append(results, torrent)
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].Seeds > results[j].Seeds
+	})
+	return results
+}
+
 // SearchMovieSilent ...
 func SearchMovieSilent(xbmcHost *xbmc.XBMCHost, searchers []MovieSearcher, movie *tmdb.Movie, withAuth bool) []*bittorrent.TorrentFile {
 	torrentsChan := make(chan *bittorrent.TorrentFile)

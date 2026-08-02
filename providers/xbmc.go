@@ -41,10 +41,16 @@ type AddonSearcher struct {
 var cbLock = sync.RWMutex{}
 var callbacks = map[string]chan []byte{}
 
+type callbackEnvelope struct {
+	Done    bool            `json:"done"`
+	Results json.RawMessage `json:"results"`
+	Version int             `json:"version"`
+}
+
 // GetCallback ...
 func GetCallback() (string, chan []byte) {
 	cid := strconv.Itoa(rand.Int())
-	c := make(chan []byte, 1) // make sure we don't block clients when we write on it
+	c := make(chan []byte, 32) // progressive providers can send several batches
 	cbLock.Lock()
 	callbacks[cid] = c
 	cbLock.Unlock()
@@ -70,10 +76,13 @@ func CallbackHandler(ctx *gin.Context) {
 	if !ok {
 		return
 	}
-	RemoveCallback(cid)
 	body, _ := io.ReadAll(ctx.Request.Body)
-	c <- body
-	close(c)
+	select {
+	case c <- body:
+	case <-time.After(5 * time.Second):
+		asLog := logging.MustGetLogger("provider-callback")
+		asLog.Warningf("Callback %s queue is full", cid)
+	}
 }
 
 func getSearchers(xbmcHost *xbmc.XBMCHost, callbackHost string) []interface{} {
@@ -432,17 +441,39 @@ func (as *AddonSearcher) GetEpisodeSearchObject(show *tmdb.Show, season *tmdb.Se
 	return sObject
 }
 
-func (as *AddonSearcher) call(method string, searchObject interface{}) []*bittorrent.TorrentFile {
+func decodeCallback(result []byte) ([]*bittorrent.TorrentFile, bool, error) {
 	torrents := make([]*bittorrent.TorrentFile, 0)
+	if err := json.Unmarshal(result, &torrents); err == nil {
+		return torrents, true, nil
+	}
+
+	envelope := &callbackEnvelope{}
+	if err := json.Unmarshal(result, envelope); err != nil {
+		return nil, true, err
+	}
+	if len(envelope.Results) == 0 {
+		return torrents, envelope.Done, nil
+	}
+	if err := json.Unmarshal(envelope.Results, &torrents); err != nil {
+		return nil, envelope.Done, err
+	}
+
+	return torrents, envelope.Done, nil
+}
+
+func (as *AddonSearcher) callStream(method string, searchObject interface{}, progressive bool) <-chan []*bittorrent.TorrentFile {
+	output := make(chan []*bittorrent.TorrentFile, 8)
 	cid, c := GetCallback()
 	cbURL := fmt.Sprintf("http://%s/callbacks/%s", as.callbackHost, cid)
 
 	payload := &SearchPayload{
-		Method:           method,
-		CallbackURL:      cbURL,
-		CallbackLogin:    config.Args.LocalLogin,
-		CallbackPassword: config.Args.LocalPassword,
-		SearchObject:     searchObject,
+		Method:             method,
+		CallbackURL:        cbURL,
+		CallbackLogin:      config.Args.LocalLogin,
+		CallbackPassword:   config.Args.LocalPassword,
+		Progressive:        progressive,
+		ProgressiveTimeout: 130,
+		SearchObject:       searchObject,
 	}
 
 	as.xbmcHost.ExecuteAddon(as.addonID, payload.String())
@@ -452,17 +483,52 @@ func (as *AddonSearcher) call(method string, searchObject interface{}) []*bittor
 		timeout = time.Duration(config.Get().CustomProviderTimeout) * time.Second
 	}
 
-	select {
-	case <-time.After(timeout):
-		as.log.Warningf("Provider %s was too slow. Ignored.", as.addonID)
-		RemoveCallback(cid)
-	case result := <-c:
-		if err := json.Unmarshal(result, &torrents); err != nil {
-			log.Errorf("Failed to unmarshal torrents: %s", err)
+	if progressive && timeout < 130*time.Second {
+		timeout = 130 * time.Second
+	}
+
+	go func() {
+		defer close(output)
+		defer RemoveCallback(cid)
+
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-timer.C:
+				as.log.Warningf("Provider %s was too slow. Ignored.", as.addonID)
+				return
+			case result := <-c:
+				torrents, done, err := decodeCallback(result)
+				if err != nil {
+					log.Errorf("Failed to unmarshal torrents: %s", err)
+					return
+				}
+				if len(torrents) > 0 {
+					output <- torrents
+				}
+				if done {
+					return
+				}
+			}
 		}
+	}()
+
+	return output
+}
+
+func (as *AddonSearcher) call(method string, searchObject interface{}) []*bittorrent.TorrentFile {
+	torrents := make([]*bittorrent.TorrentFile, 0)
+	for batch := range as.callStream(method, searchObject, false) {
+		torrents = append(torrents, batch...)
 	}
 
 	return torrents
+}
+
+func (as *AddonSearcher) callProgressive(method string, searchObject interface{}) <-chan []*bittorrent.TorrentFile {
+	return as.callStream(method, searchObject, true)
 }
 
 // SearchLinks ...
@@ -477,6 +543,17 @@ func (as *AddonSearcher) SearchMovieLinks(movie *tmdb.Movie) []*bittorrent.Torre
 	}
 
 	return as.call("search_movie", as.GetMovieSearchObject(movie))
+}
+
+// SearchMovieLinksProgressive streams provider batches as they become ready.
+func (as *AddonSearcher) SearchMovieLinksProgressive(movie *tmdb.Movie) <-chan []*bittorrent.TorrentFile {
+	if movie == nil {
+		output := make(chan []*bittorrent.TorrentFile)
+		close(output)
+		return output
+	}
+
+	return as.callProgressive("search_movie", as.GetMovieSearchObject(movie))
 }
 
 // SearchMovieLinksSilent ...

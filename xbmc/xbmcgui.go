@@ -16,6 +16,19 @@ type DialogProgressBG struct {
 	hWnd string
 }
 
+// DialogSelectLargeProgressive is an asynchronously updateable selection list.
+type DialogSelectLargeProgressive struct {
+	Host *XBMCHost
+	hWnd string
+}
+
+// DialogSelectLargeProgressiveResult describes the current dialog state.
+type DialogSelectLargeProgressiveResult struct {
+	Done   bool   `json:"done"`
+	Choice int    `json:"choice"`
+	Value  string `json:"value"`
+}
+
 // OverlayStatus ...
 type OverlayStatus struct {
 	Host *XBMCHost
@@ -274,6 +287,35 @@ func (h *XBMCHost) ListDialogLarge(title string, subject string, items ...string
 	retVal := -1
 	h.executeJSONRPCEx("Dialog_Select_Large", &retVal, Args{title, subject, items})
 	return retVal
+}
+
+// NewDialogSelectLargeProgressive opens a non-modal list that can be updated.
+func (h *XBMCHost) NewDialogSelectLargeProgressive(title string, subject string, items ...string) *DialogSelectLargeProgressive {
+	retVal := ""
+	h.executeJSONRPCEx("Dialog_Select_Large_Progressive_Create", &retVal, Args{title, subject, items})
+	if retVal == "" {
+		return nil
+	}
+	return &DialogSelectLargeProgressive{Host: h, hWnd: retVal}
+}
+
+// Update replaces all visible items while preserving the selected position.
+func (dialog *DialogSelectLargeProgressive) Update(items ...string) {
+	retVal := -1
+	dialog.Host.executeJSONRPCEx("Dialog_Select_Large_Progressive_Update", &retVal, Args{dialog.hWnd, items})
+}
+
+// Result returns whether the user has closed the dialog and their choice.
+func (dialog *DialogSelectLargeProgressive) Result() DialogSelectLargeProgressiveResult {
+	retVal := DialogSelectLargeProgressiveResult{Choice: -1}
+	dialog.Host.executeJSONRPCEx("Dialog_Select_Large_Progressive_Result", &retVal, Args{dialog.hWnd})
+	return retVal
+}
+
+// Close closes and releases the progressive dialog.
+func (dialog *DialogSelectLargeProgressive) Close() {
+	retVal := -1
+	dialog.Host.executeJSONRPCEx("Dialog_Select_Large_Progressive_Close", &retVal, Args{dialog.hWnd})
 }
 
 // PlayerGetPlayingFile ...
