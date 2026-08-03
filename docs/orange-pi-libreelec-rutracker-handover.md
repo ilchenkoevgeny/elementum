@@ -271,7 +271,20 @@ profile 1 seqovl abs 664
 /storage/zapret-v72.13/config/rutracker-hosts.txt
 ```
 
-В списке было два имени RuTracker. `cloudflare.com` в профиль не входил и проходил без модификации.
+Изначально в списке было два имени RuTracker. Позже в тот же профиль добавлены:
+
+```text
+rutor.info
+www.rutor.info
+```
+
+После перезапуска `nfqws-rutracker.service` контрольный запрос к `https://rutor.info/` вернул:
+
+```text
+HTTP=200 bytes=116521 speed=126079 time=0.924184
+```
+
+Таким образом, сетевой доступ к RuTor через HTTPS также подтверждён. Однако сам Burst-провайдер пока обращается к устаревшему адресу `http://rutor.lib`; это отдельная настройка/ошибка провайдера, а не проблема nfqws. `cloudflare.com` в профиль не входит и проходит без модификации.
 
 Сервис:
 
@@ -522,19 +535,20 @@ branch: feature/progressive-results
 
 Установленная версия: `0.1.114`, ARM64.
 
-Основной commit реализации:
+Основные commits реализации:
 
-```text
-2952d71f177f1f98c19e01448f3a942258952754 Show progressive movie torrent results
-```
+| Назначение | Commit |
+|---|---|
+| Progressive movie torrent results | `2952d71f177f1f98c19e01448f3a942258952754` |
+| Исправление deadlock при разрешении torrent | `442ba23f78355d6bccd40b890414f0a8e1db0cbf` |
 
 Изменённые части:
 
 | Файл | Назначение |
 |---|---|
 | `providers/payload.go` | флаги progressive и timeout |
-| `providers/xbmc.go` | поток callback-пакетов, timeout около 130 секунд |
-| `providers/search.go` | `SearchMovieProgressive`, слияние, дедупликация, сортировка |
+| `providers/xbmc.go` | поток callback-пакетов; окно приёма равно `ProgressiveTimeout + 15 секунд` |
+| `providers/search.go` | `SearchMovieProgressive`, слияние, дедупликация, сортировка; отсутствие записи UI-прогресса в silent-режиме |
 | `api/movies.go` | обновляемый диалог выбора торрента |
 | `xbmc/xbmcgui.go` | RPC-обёртка прогрессивного диалога |
 
@@ -547,6 +561,17 @@ Artifact: linux-arm64 (ID 8838564353)
 ```
 
 ARM64 job прошёл успешно. Общий workflow отмечался красным только потому, что финальный job упаковки ожидал артефакты всех платформ.
+
+После исправления deadlock запущен новый workflow:
+
+```text
+Run ID: 30781670427
+Commit: 442ba23f78355d6bccd40b890414f0a8e1db0cbf
+ARM64 job: 91587407912
+Artifact: linux-arm64 (ID 8843904018, около 10,1 МБ)
+```
+
+Новый ARM64 job завершился успешно. Actions artifact требует авторизацию GitHub и не скачивается обычным анонимным `wget`; его ещё нужно разместить в публичной artifact-ветке либо скачать авторизованным способом. На Orange Pi новая сборка пока не установлена и не проверена.
 
 Установленный бинарник:
 
@@ -569,13 +594,24 @@ https://github.com/ilchenkoevgeny/plugin.video.elementum
 branch: feature/progressive-results
 ```
 
-Основной commit:
+Основные commits:
 
-```text
-899b198e2af606464e326d198d21d39ea2c3646b
-```
+| Назначение | Commit |
+|---|---|
+| RPC для progressive-диалога | `899b198e2af606464e326d198d21d39ea2c3646b` |
+| Переключаемая тёмная тема Web UI | `29761577d9a6e42cd4e7c741a66089b8bde1db14` |
 
 Python-обёртка Kodi реализует RPC для создания и обновления пользовательского progressive-диалога.
+
+В Web UI добавлена тёмная тема:
+
+- тёмный режим используется по умолчанию;
+- переключатель `Light theme / Dark theme` находится в верхнем меню;
+- выбор сохраняется в `localStorage`;
+- тема применяется к меню, таблицам, вкладкам, формам, модальным окнам, поиску и карте частей torrent;
+- production-сборка `resources/web` успешно создана и включена в commit.
+
+Тёмная тема опубликована в ветке, но ещё не установлена и не проверена в Web UI на Orange Pi.
 
 ## 15. Критически важное различие: найденный результат и готовая ссылка
 
@@ -593,6 +629,15 @@ Burst нашёл строку
 
 Если загрузка `.torrent` вернула 403/502/503, сырая строка не попадёт в UI. Поэтому пустое окно не доказывает, что поиск провайдера не сработал.
 
+После исправления `/torrent` проявилась отдельная ошибка Elementum. В progressive/silent-режиме `processLinks(..., true)` не создавал обработчик UI-прогресса, но после успешного разрешения torrent всё равно пытался записать сообщение в необслуживаемый канал `progressUpdate`. Горутины блокировались, `wg.Wait()` не завершался, и разрешённые результаты не доходили до диалога.
+
+Commit `442ba23f` исправляет это поведение:
+
+- канал прогресса создаётся только в обычном, не silent-режиме;
+- в progressive/silent-режиме записи в него не выполняются;
+- обычные обновления прогресса сделаны неблокирующими;
+- окно приёма callback увеличено до `ProgressiveTimeout + 15 секунд`, то есть при текущих настройках со 130 до 145 секунд.
+
 ## 16. Текущее подтверждённое состояние
 
 На 2026-08-03 подтверждено:
@@ -602,12 +647,16 @@ Burst нашёл строку
 - GUI Chromium проходит Cloudflare;
 - bridge extension связана с relay;
 - RuTracker HTML успешно извлекается;
-- Burst-парсер нашёл **26 результатов за 18,7 секунды**;
-- Burst отправил лучшие 10 результатов в progressive callback;
-- каждый из 10 запросов к локальному `/torrent` вернул **HTTP 502**;
-- Elementum получил `0 unique links`, поэтому UI остался пустым.
+- прежний тест Burst-парсера нашёл **26 результатов за 18,7 секунды**;
+- контрольный запрос к `/torrent` для `dl.php?t=5496085` теперь возвращает **HTTP 200**, `Content-Type: application/x-bittorrent` и **15 365 байт**;
+- progressive callbacks действительно поступают в Elementum через `POST /callbacks/<id>`;
+- в последнем поиске RuTracker вернул 9 результатов, LostFilm — 3, Burst собрал 12;
+- UI всё равно остался пустым, потому что установленный ARM64-бинарник Elementum блокируется в `processLinks()` после успешного разрешения torrent;
+- исправление deadlock опубликовано и ARM64 artifact успешно собран, но на Orange Pi ещё не установлен;
+- `https://rutor.info/` через nfqws возвращает HTTP 200, однако провайдер Burst всё ещё использует неверный `http://rutor.lib`;
+- одновременно перестали загружаться постеры; эта отдельная проблема TMDB/метаданных пока не диагностирована.
 
-Это означает, что текущий главный блокер уже не поиск и не парсинг RuTracker. Блокер — браузерная загрузка конкретного `.torrent` через `/torrent`.
+Главный блокер уже не поиск, не парсинг RuTracker, не browser bridge и не загрузка `.torrent`. Текущий блокер — установленная старая ARM64-сборка с deadlock в progressive `processLinks()`. Следующая проверка должна выполняться только после установки artifact из commit `442ba23f`.
 
 У других провайдеров ситуация отдельная:
 
@@ -618,24 +667,25 @@ Burst нашёл строку
 
 ## 17. Точка продолжения работы
 
-Первым делом в новом чате нужен полный ответ одного failing-запроса:
+Контрольный `/torrent` повторять как первичную диагностику больше не нужно: его успешный ответ уже подтверждён:
 
-```sh
-curl -sS -i --max-time 60 \
-  'http://127.0.0.1:9911/torrent?url=https%3A%2F%2Frutracker.org%2Fforum%2Fdl.php%3Ft%3D5496085'
+```text
+HTTP/1.0 200 OK
+Content-Type: application/x-bittorrent
+Content-Length: 15365
 ```
-
-Нужно сохранить весь ответ: HTTP-заголовки и JSON/body. Именно он должен показать внутреннюю причину 502 — например, browser fetch, redirect, Content-Disposition, блокировку скачивания, неверный MIME, потерю session state или ошибку base64.
 
 Приоритет следующих действий:
 
-1. Разобрать тело ответа 502 `/torrent`.
-2. Исправить получение `dl.php?t=...` через браузер. Если `fetch()` не подходит, реализовать навигацию/перехват download либо чтение ответа другим browser API.
-3. Проверить, что relay возвращает реальные байты bencoded torrent (`d...e`) и корректный `Content-Type`.
-4. Повторить один результат до появления `Received 1 unique links`.
-5. Только после этого тестировать пакет из 10 и progressive UI.
+1. Сделать artifact `linux-arm64` из run `30781670427` доступным для скачивания или скачать его авторизованным способом.
+2. Сохранить текущий бинарник Elementum и установить сборку commit `442ba23f` на Orange Pi.
+3. Перезапустить Elementum/Kodi и выполнить один поиск фильма при открытой вкладке RuTracker в Chromium.
+4. Проверить, что первые разрешённые результаты появляются до общего завершения всех провайдеров и что в логе есть `Received N unique links`, где `N > 0`.
+5. Установить обновлённый `plugin.video.elementum` из commit `29761577` и проверить переключение тёмной/светлой темы в Web UI с сохранением выбора после обновления страницы.
 6. Исправить автоматический запуск relay после рестарта контейнера/Orange Pi.
-7. Затем отдельно разбирать 403/503 остальных провайдеров.
+7. Исправить URL RuTor с `http://rutor.lib` на рабочий `https://rutor.info` и повторить поиск.
+8. Отдельно диагностировать загрузку постеров/TMDB; это не следует смешивать с progressive callback.
+9. Затем отдельно разбирать 403/503 остальных провайдеров.
 
 ## 18. Быстрая диагностика после перезагрузки
 
@@ -679,7 +729,7 @@ docker exec -d chromium-rutracker \
 ```sh
 KODI_LOG=/storage/.kodi/temp/kodi.log
 grep -Ei \
-  'Chromium bridge|rutracker|returned|torrent|HTTP 502|unique links|Providers returned' \
+  'Chromium bridge|rutracker|rutor|returned|torrent|HTTP [0-9]+|callbacks|unique links|Providers returned|too slow|TMDB|poster' \
   "$KODI_LOG" | tail -n 200
 ```
 
@@ -690,6 +740,8 @@ grep -Ei \
 - Не считать копирование `cf_clearance` достаточным решением.
 - Не направлять весь торрент-трафик через WARP/VPN.
 - Не считать `RuTracker returned N results` окончательным успехом: нужно проверить загрузку `.torrent` и `Received N unique links`.
+- Не возвращаться к диагностике старого `HTTP 502`: контрольный `/torrent` уже подтверждён как исправный.
+- Не считать наличие `POST /callbacks/<id>` доказательством полной работоспособности UI: установленный бинарник может заблокироваться позже, во время разрешения torrent.
 - Не ждать полной загрузки вкладки RuTracker: баннеры и вторичные ресурсы могут держать индикатор загрузки, хотя таблица результатов уже готова.
 
 ## 20. Безопасность и резервные копии
@@ -702,5 +754,4 @@ grep -Ei \
 
 ## 21. Короткий текст для начала нового чата
 
-> Продолжаем работу по `docs/orange-pi-libreelec-rutracker-handover.md` в репозитории `ilchenkoevgeny/elementum`, ветка `feature/progressive-results`. Кастомное LibreELEC-ядро 6.6.71 с NFQUEUE и Zapret уже работают, GUI Chromium проходит Cloudflare, browser bridge получает и парсит RuTracker. Последний подтверждённый результат: Burst нашёл 26 раздач, но все запросы `/torrent` вернули HTTP 502, поэтому Elementum получил 0 unique links. Вот полный ответ контрольного `curl -i` к `/torrent`: ...
-
+> Продолжаем работу по `docs/orange-pi-libreelec-rutracker-handover.md` в репозитории `ilchenkoevgeny/elementum`, ветка `feature/progressive-results`. Кастомное LibreELEC-ядро 6.6.71 с NFQUEUE и Zapret работают, GUI Chromium проходит Cloudflare, browser bridge получает RuTracker и успешно отдаёт `.torrent`: контрольный запрос вернул HTTP 200 и 15 365 байт. Progressive callbacks приходят, но установленный Elementum блокируется в `processLinks()` после успешного разрешения torrent. Исправление опубликовано в commit `442ba23f`, ARM64 artifact из run `30781670427` собран успешно, но ещё не установлен. В `plugin.video.elementum` commit `29761577` добавлена тёмная Web UI-тема. Следующий шаг — установить новый ARM64-бинарник и повторить один поиск.
