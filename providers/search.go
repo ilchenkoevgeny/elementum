@@ -268,13 +268,18 @@ func processLinks(xbmcHost *xbmc.XBMCHost, torrentsChan chan *bittorrent.Torrent
 	log.Info("Resolving torrent files...")
 	progress := 0
 	progressTotal := 1
-	progressUpdate := make(chan string)
+	var progressUpdate chan string
+	if !isSilent {
+		progressUpdate = make(chan string, 1)
+	}
 	closed := event.Event{}
 
 	defer func() {
 		log.Debug("Closing progressupdate")
 		closed.Set()
-		close(progressUpdate)
+		if progressUpdate != nil {
+			close(progressUpdate)
+		}
 	}()
 
 	wg := sync.WaitGroup{}
@@ -309,11 +314,17 @@ func processLinks(xbmcHost *xbmc.XBMCHost, torrentsChan chan *bittorrent.Torrent
 						return
 					}
 
-					if !strings.HasPrefix(torrent.URI, "magnet") {
-						progress++
-						progressUpdate <- "LOCALIZE[30117]"
-					} else {
-						progressUpdate <- "skip"
+					if !isSilent {
+						message := "skip"
+						if !strings.HasPrefix(torrent.URI, "magnet") {
+							progress++
+							message = "LOCALIZE[30117]"
+						}
+
+						select {
+						case progressUpdate <- message:
+						default:
+						}
 					}
 
 					return

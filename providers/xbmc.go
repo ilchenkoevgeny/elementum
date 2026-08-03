@@ -483,8 +483,11 @@ func (as *AddonSearcher) callStream(method string, searchObject interface{}, pro
 		timeout = time.Duration(config.Get().CustomProviderTimeout) * time.Second
 	}
 
-	if progressive && timeout < 130*time.Second {
-		timeout = 130 * time.Second
+	if progressive {
+		progressiveTimeout := time.Duration(payload.ProgressiveTimeout)*time.Second + 15*time.Second
+		if timeout < progressiveTimeout {
+			timeout = progressiveTimeout
+		}
 	}
 
 	go func() {
