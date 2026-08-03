@@ -1,0 +1,52 @@
+name: publish ARM64 artifact
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/progressive-results
+    paths:
+      - .github/workflows/publish-arm64-artifact.yml
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish linux-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and verify Actions artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl --fail --location \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/8843904018/zip" \
+            --output artifact.zip
+
+          echo "af4f8307f12678f3da0a690611029a0fbcde0075b290da16aa29fa5b0368af66  artifact.zip" |
+            sha256sum --check -
+
+          mkdir -p extracted public/linux_arm64
+          unzip -q artifact.zip -d extracted
+          unzip -q extracted/elementum..linux_arm64.zip -d public/linux_arm64
+          chmod 0755 public/linux_arm64/elementum
+
+          echo "90ede4c56164c8131661a9892e5b7e534642ee898d4b514d5647d1840f92f84b  elementum" \
+            > public/linux_arm64/elementum.sha256
+
+          (
+            cd public/linux_arm64
+            sha256sum --check elementum.sha256
+          )
+
+      - name: Publish artifacts branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: artifacts
+          publish_dir: ./public
+          force_orphan: true
+          commit_message: Publish ARM64 build 442ba23f
