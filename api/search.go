@@ -101,10 +101,51 @@ func Search(s *bittorrent.Service) gin.HandlerFunc {
 		}
 
 		if !usedProgressiveDialog {
+			choices := make([]string, 0, len(torrents))
+			for _, torrent := range torrents {
+				resolution := ""
+				if torrent.Resolution > 0 {
+					resolution = fmt.Sprintf("[B]%s[/B] ", util.ApplyColor(bittorrent.Resolutions[torrent.Resolution], bittorrent.Colors[torrent.Resolution]))
+				}
+
+				info := make([]string, 0)
+				if torrent.Size != "" {
+					info = append(info, fmt.Sprintf("[B][%s][/B]", torrent.Size))
+				}
+				if torrent.RipType > 0 {
+					info = append(info, bittorrent.Rips[torrent.RipType])
+				}
+				if torrent.VideoCodec > 0 {
+					info = append(info, bittorrent.Codecs[torrent.VideoCodec])
+				}
+				if torrent.AudioCodec > 0 {
+					info = append(info, bittorrent.Codecs[torrent.AudioCodec])
+				}
+				if torrent.Provider != "" {
+					info = append(info, fmt.Sprintf(" - [B]%s[/B]", torrent.Provider))
+				}
+
+				multi := ""
+				if torrent.Multi {
+					multi = multiType
+				}
+
+				label := fmt.Sprintf("%s(%d / %d) %s\n%s\n%s%s",
+					resolution,
+					torrent.Seeds,
+					torrent.Peers,
+					strings.Join(info, " "),
+					torrent.Name,
+					torrent.Icon,
+					multi,
+				)
+				choices = append(choices, label)
+			}
+
 			if playAction == "play" {
 				choice = 0
 			} else {
-				choice = xbmcHost.ListDialogLarge("LOCALIZE[30228]", query, movieTorrentChoices(torrents)...)
+				choice = xbmcHost.ListDialogLarge("LOCALIZE[30228]", query, choices...)
 			}
 		}
 
@@ -180,10 +221,9 @@ func searchHistoryAppend(ctx *gin.Context, historyType string, query string) {
 func searchHistoryList(ctx *gin.Context, historyType string) {
 	historyList := []string{}
 	var qs []database.QueryHistory
-	if err := database.GetStormDB().Select(q.Eq("Type", historyType)).OrderBy("Dt").Reverse().Find(&qs); err == nil {
-		for _, q := range qs {
-			historyList = append(historyList, q.Query)
-		}
+	database.GetStormDB().Select(q.Eq("Type", historyType)).OrderBy("Dt").Reverse().Find(&qs)
+	for _, q := range qs {
+		historyList = append(historyList, q.Query)
 	}
 
 	urlPrefix := ""
@@ -191,16 +231,36 @@ func searchHistoryList(ctx *gin.Context, historyType string) {
 		urlPrefix = "/" + historyType
 	}
 
-	items := xbmc.ListItems{
-		{Label: "LOCALIZE[30209]", Path: URLForXBMC(urlPrefix+"/search") + "?keyboard=1", Thumbnail: config.AddonResource("img", "search.png")},
-	}
+	items := make(xbmc.ListItems, 0, len(historyList)+1)
+	items = append(items, &xbmc.ListItem{
+		Label:     "LOCALIZE[30323]",
+		Path:      URLQuery(URLForXBMC(urlPrefix+"/search"), "keyboard", "1"),
+		Thumbnail: config.AddonResource("img", "search.png"),
+		Icon:      config.AddonResource("img", "search.png"),
+	})
 
 	for _, query := range historyList {
 		items = append(items, &xbmc.ListItem{
 			Label: query,
 			Path:  searchHistoryGetXbmcURL(historyType, query),
 			ContextMenu: [][]string{
-				{"LOCALIZE[30316]", fmt.Sprintf("RunPlugin(%s)", URLQuery(URLForXBMC("/search/remove"), "q", query, "type", historyType))},
+				{
+					"LOCALIZE[30406]",
+					fmt.Sprintf("RunPlugin(%s)",
+						URLQuery(URLForXBMC("/search/remove"),
+							"query", query,
+							"type", historyType,
+						),
+					),
+				},
+				{
+					"LOCALIZE[30604]",
+					fmt.Sprintf("RunPlugin(%s)",
+						URLQuery(URLForXBMC("/search/clear"),
+							"type", historyType,
+						),
+					),
+				},
 			},
 		})
 	}
@@ -208,25 +268,52 @@ func searchHistoryList(ctx *gin.Context, historyType string) {
 	ctx.JSON(200, xbmc.NewView("", items))
 }
 
+// SearchRemove ...
+func SearchRemove(ctx *gin.Context) {
+	defer perf.ScopeTimer()()
+
+	xbmcHost, _ := xbmc.GetXBMCHostWithContext(ctx)
+	if xbmcHost == nil {
+		return
+	}
+
+	query := ctx.DefaultQuery("query", "")
+	historyType := ctx.DefaultQuery("type", "")
+
+	if len(query) == 0 {
+		return
+	}
+
+	log.Debugf("Removing query '%s' with history type '%s'", query, historyType)
+	database.GetStorm().RemoveSearchHistory(historyType, query)
+	xbmcHost.Refresh()
+
+	ctx.String(200, "")
+}
+
+// SearchClear ...
+func SearchClear(ctx *gin.Context) {
+	defer perf.ScopeTimer()()
+
+	xbmcHost, _ := xbmc.GetXBMCHostWithContext(ctx)
+	if xbmcHost == nil {
+		return
+	}
+
+	historyType := ctx.DefaultQuery("type", "")
+
+	log.Debugf("Cleaning queries with history type %s", historyType)
+	database.GetStorm().CleanSearchHistory(historyType)
+	xbmcHost.Refresh()
+
+	ctx.String(200, "")
+}
+
 func searchHistoryGetXbmcURL(historyType string, query string) string {
 	urlPrefix := ""
 	if len(historyType) > 0 {
 		urlPrefix = "/" + historyType
 	}
-	return URLQuery(URLForXBMC(urlPrefix+"/search"), "q", strings.TrimSpace(query))
-}
 
-// SearchRemove ...
-func SearchRemove(ctx *gin.Context) {
-	query := ctx.Query("q")
-	historyType := ctx.Query("type")
-	if query == "" {
-		return
-	}
-
-	database.GetStorm().RemoveSearchHistory(historyType, query)
-	xbmcHost, _ := xbmc.GetXBMCHostWithContext(ctx)
-	if xbmcHost != nil {
-		xbmcHost.Refresh()
-	}
+	return URLQuery(URLForXBMC(urlPrefix+"/search"), "q", query)
 }
