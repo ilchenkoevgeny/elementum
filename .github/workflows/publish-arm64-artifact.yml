@@ -5,42 +5,66 @@ on:
   push:
     branches:
       - feature/progressive-results
-    paths:
-      - .github/workflows/publish-arm64-artifact.yml
 
 permissions:
   contents: write
 
+concurrency:
+  group: publish-arm64-feature-progressive-results
+  cancel-in-progress: true
+
 jobs:
   publish:
-    name: Publish linux-arm64
+    name: Build and publish linux-arm64
     runs-on: ubuntu-latest
     steps:
-      - name: Download and verify Actions artifact
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get complete Git history
         run: |
-          curl --fail --location \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/8843904018/zip" \
-            --output artifact.zip
+          git fetch --tags --force
+          git fetch --prune --unshallow || true
 
-          echo "af4f8307f12678f3da0a690611029a0fbcde0075b290da16aa29fa5b0368af66  artifact.zip" |
-            sha256sum --check -
+      - name: Prepare Go cache
+        run: |
+          mkdir -p ~/.cache/go-build ~/.cache/go-cache ~/.cache/go-modcache
+          echo "GOPATH=$(readlink -f ~/.cache/go-build)" >> "$GITHUB_ENV"
+          echo "GOCACHE=$(readlink -f ~/.cache/go-cache)" >> "$GITHUB_ENV"
+          echo "GOMODCACHE=$(readlink -f ~/.cache/go-modcache)" >> "$GITHUB_ENV"
 
-          mkdir -p extracted public/linux_arm64
-          unzip -q artifact.zip -d extracted
-          unzip -q extracted/elementum..linux_arm64.zip -d public/linux_arm64
+      - name: Build linux-arm64
+        env:
+          GO_GCFLAGS: github.com/ElementumOrg/libtorrent-go=-lang=go1.17
+        run: |
+          make linux-arm64
+          make zip PLATFORM=linux-arm64
+
+      - name: Prepare public artifact
+        run: |
+          set -eux
+          ZIP_FILE="$(find build -maxdepth 1 -type f -name '*.zip' | head -n 1)"
+          test -n "$ZIP_FILE"
+
+          mkdir -p public/linux_arm64
+          unzip -q "$ZIP_FILE" -d public/linux_arm64
+
+          BINARY="$(find public/linux_arm64 -type f -name elementum | head -n 1)"
+          test -n "$BINARY"
+
+          if [ "$BINARY" != "public/linux_arm64/elementum" ]; then
+            cp "$BINARY" public/linux_arm64/elementum
+          fi
+
           chmod 0755 public/linux_arm64/elementum
-
-          echo "90ede4c56164c8131661a9892e5b7e534642ee898d4b514d5647d1840f92f84b  elementum" \
-            > public/linux_arm64/elementum.sha256
-
           (
             cd public/linux_arm64
-            sha256sum --check elementum.sha256
+            sha256sum elementum > elementum.sha256
           )
+
+          printf '%s\n' "${GITHUB_SHA}" > public/linux_arm64/source-commit.txt
+          file public/linux_arm64/elementum
+          cat public/linux_arm64/elementum.sha256
 
       - name: Publish artifacts branch
         uses: peaceiris/actions-gh-pages@v4
@@ -49,4 +73,4 @@ jobs:
           publish_branch: artifacts
           publish_dir: ./public
           force_orphan: true
-          commit_message: Publish ARM64 build 442ba23f
+          commit_message: Publish ARM64 build ${{ github.sha }}
