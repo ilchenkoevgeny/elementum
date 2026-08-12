@@ -1,6 +1,6 @@
 # Orange Pi 3 + LibreELEC + Elementum: актуальный handover
 
-> Обновлено 2026-08-09 по результатам работ до 2026-08-07. Этот файл является основной точкой продолжения работы в новом чате.
+> Обновлено 2026-08-12. Этот файл является основной точкой продолжения работы в новом чате.
 
 ## 1. Главная цель
 
@@ -660,3 +660,511 @@ Relay должен слушать только:
 ## 16. Короткий текст для нового чата
 
 > Продолжаем работу по `docs/orange-pi-libreelec-rutracker-handover.md` в `ilchenkoevgeny/elementum`, ветка `feature/progressive-results`. Progressive search и повторные поиски работают. RuTracker использует GUI Chromium через bridge `127.0.0.1:9911`. Chromium запускается on-demand, во время работы получает `Restart=unless-stopped`, а после 120 секунд простоя внешний `rutracker-chromium-idle-watchdog.service` ставит `Restart=no` и останавливает контейнер. Внутренний watchdog отключён. Причиной самопроизвольного повторного запуска был старый `rutracker-stack-watchdog.timer`, который каждую минуту вызывал `/storage/.config/rutracker-bridge-runner.sh` с `docker start`; таймер отключён, и через 75 секунд Chromium остался `Running=false Restart=no`. Следующая отдельная задача — RuTor: Chromium для него не использовать. Нужно прочитать установленный `providers.json` и сравнить HTTP/HTTPS `rutor.info`/`rutor.is`, затем по результату исправлять URL либо parser.
+
+## 17. H6 Hantro G2 VP9: cold-start проблема и подтверждённый workaround
+
+### 17.1. Симптом
+
+На Orange Pi 3 / Allwinner H6 аппаратный VP9-декодер Hantro G2 после холодной загрузки LibreELEC может не завершать первый decode job.
+
+Устройство и драйверы:
+
+```text
+/dev/video0 = cedrus
+/dev/video1 = sun50i-di
+/dev/video2 = allwinner,sun50i-h6-vpu-g2-dec
+```
+
+Поддерживаемые compressed INPUT-форматы:
+
+```text
+Cedrus /dev/video0:
+MG2S, S264, S265, VP8F
+
+Hantro /dev/video2:
+VP9F
+```
+
+То есть VP9 реально идёт через Hantro G2, а H.264 — через Cedrus.
+
+Типичный cold failure в Kodi:
+
+```text
+CDVDVideoCodecDRMPRIME::Open - using decoder Google VP9
+[vp9] v4l2_request_queue_decode: request ... timeout
+...
+CDVDVideoCodecDRMPRIME::AddData - send packet failed: Operation not permitted (-1)
+```
+
+Kernel:
+
+```text
+hantro_watchdog:127: frame processing timed out!
+```
+
+При этом Hantro не генерирует completion IRQ:
+
+```text
+Cedrus IRQ 121 = 0
+Hantro IRQ 122 = 0
+```
+
+После того как Hantro однажды переведён в рабочее состояние, VP9 1080p60/1440p60 работает, 2160p60 запускается. Проблемы устойчивой производительности 2160p60 (`OutputPicture - timeout`, визуальное замедление видео при нормальном аудио) являются отдельной задачей и не смешиваются с cold-start.
+
+### 17.2. Стабильный тестовый ролик
+
+Для прямого запуска через YouTube addon использовался:
+
+```sh
+kodi-send --action="PlayMedia(plugin://plugin.video.youtube/play/?video_id=TEklhVioz7I)"
+```
+
+Это длинный русскоязычный ролик по квантовой механике. Он использовался как стабильный повторяемый тест, а не как HDR demo.
+
+### 17.3. Первое важное наблюдение: Cedrus/H.264 прогревает Hantro
+
+На чистой загрузке:
+
+```text
+Cedrus IRQ 121 = 0
+Hantro IRQ 122 = 0
+```
+
+VP9 зависал с watchdog.
+
+Для диагностики YouTube addon временно принудительно фильтровался до AVC (`codec == avc1`). Был подтверждён реальный hardware H.264 decode:
+
+```text
+CDVDVideoCodecDRMPRIME::Open - using decoder H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10
+Cedrus IRQ 121 > 0
+Hantro IRQ 122 = 0
+```
+
+После остановки H.264, восстановления addon, restart Kodi и запуска VP9 в том же boot:
+
+```text
+CDVDVideoCodecDRMPRIME::Open - using decoder Google VP9
+Hantro IRQ 122 > 0
+```
+
+VP9 начинал работать.
+
+Ключевой контрольный тест с ранней остановкой Cedrus дал всего:
+
+```text
+Cedrus IRQ 121 = 10
+```
+
+после чего Hantro набрал тысячи IRQ и VP9 работал.
+
+Это сначала указывало на возможную связь с реальным Cedrus job, но дальнейшие тесты сузили механизм ещё сильнее.
+
+### 17.4. Что было проверено и исключено
+
+#### Restart Kodi
+
+Один `systemctl restart kodi` на холодном состоянии Hantro проблему не исправляет.
+
+#### Runtime-PM самого Hantro
+
+Принудительное:
+
+```sh
+echo on > /sys/bus/platform/devices/1c00000.video-codec-g2/power/control
+```
+
+переводило `runtime_status` в `active`, но первый VP9 всё равно зависал. То есть обычный autosuspend/runtime-PM самого Hantro не является достаточным объяснением.
+
+#### Hantro reset pulse
+
+Для H6 reset VP9 находится в CCU `0x030016cc`, bit 16 (`RST_BUS_VP9`). На холодной системе вручную выполнялся assert/deassert reset с сохранением остальных битов.
+
+Результат: VP9 всё равно зависал, Hantro IRQ оставался 0, появлялись watchdog timeout.
+
+Следовательно, одного reset pulse Hantro недостаточно.
+
+#### IOMMU TLB flush
+
+H6 IOMMU base:
+
+```text
+0x030f0000
+```
+
+Проверялся полный TLB flush:
+
+```sh
+busybox devmem 0x030f0080 32 0x0003003F
+```
+
+Flush завершался, но cold VP9 всё равно зависал. Следовательно, проблема не сводится к обычному stale TLB.
+
+Ранее наблюдавшийся IOMMU page fault с `master 0` относится к display mixer, а не к Hantro/Cedrus. Использованная карта masters:
+
+```text
+master 0 = display mixer
+master 3 = Cedrus
+master 5 = Hantro G2
+```
+
+#### Общий MBUS/DRAM/IOMMU clock state
+
+Сравнивались COLD и GOOD состояния CCU/clock tree. Они совпали для общей fabric:
+
+```text
+0x03001540 = 0xC1000002   # MBUS
+0x030017bc = 0x00000001   # bus-IOMMU
+0x03001800 = 0x40000000   # DRAM
+0x03001804 = 0x00000005   # MBUS gates
+```
+
+То есть persistent difference в обычных MBUS/DRAM/bus-IOMMU clock/gate не найден.
+
+#### `mbus-ve` pulse
+
+Cedrus использует `mbus-ve` (`CCU 0x804 BIT1`) как `ram_clk`. На холодной системе вручную включался и выключался только этот gate.
+
+Результат: Hantro IRQ остался 0, появились новые watchdog timeout. Зелёный кадр, который однажды появился на экране, оказался display/invalid-buffer артефактом и не означал успешный Hantro progress.
+
+Следовательно, простой `mbus-ve` pulse не исправляет проблему.
+
+#### Полная ручная последовательность Cedrus clocks/reset/MBUS
+
+Вручную воспроизводилась последовательность, близкая к `cedrus_hw_resume()`/suspend:
+
+- VE reset;
+- bus/AHB clock;
+- module clock;
+- `mbus-ve`;
+- обратное выключение.
+
+Физические CCU-регистры:
+
+```text
+VE mod:  0x03001690
+VE bus/reset: 0x0300169c
+MBUS gates:   0x03001804
+```
+
+Результат: VP9 всё равно зависал.
+
+Следовательно, простая ручная имитация видимых clock/reset/MBUS регистров недостаточна.
+
+#### REQBUFS-only Cedrus
+
+После clean boot выполнялся только `VIDIOC_REQBUFS` для OUTPUT и CAPTURE `/dev/video0`, без `QBUF` и без `STREAMON`.
+
+Получено:
+
+```text
+REQBUFS type=2 count=4 memory=1 caps=0x0000001d
+REQBUFS type=1 count=4 memory=1 caps=0x00000015
+REQBUFS_ONLY=SUCCESS
+
+Cedrus IRQ 121 = 0
+Hantro IRQ 122 = 0
+```
+
+После этого VP9 всё равно висел с ромашкой.
+
+Следовательно, обычного выделения vb2 DMA/MMAP buffers недостаточно.
+
+### 17.5. Ключевой разделяющий тест: STREAMON Cedrus без decode-job
+
+Это итоговое наблюдение, на котором построен workaround.
+
+Cedrus driver для OUTPUT-очереди в `cedrus_start_streaming()` вызывает:
+
+```c
+pm_runtime_resume_and_get(dev->dev);
+```
+
+до аппаратного decode job.
+
+Был выполнен следующий путь на `/dev/video0`:
+
+```text
+open
+VIDIOC_REQBUFS (1 OUTPUT MMAP buffer)
+VIDIOC_STREAMON
+sleep 0.2 s
+VIDIOC_STREAMOFF
+VIDIOC_REQBUFS(count=0)
+close
+```
+
+При этом принципиально НЕ выполнялись:
+
+```text
+QBUF
+Media Request queue
+decode request
+hardware frame job
+```
+
+После такого праймера:
+
+```text
+Cedrus IRQ 121 = 0
+```
+
+но первый VP9 сразу запускался и Hantro начинал генерировать completion IRQ. Один из подтверждённых результатов:
+
+```text
+Cedrus IRQ 121 = 0
+Hantro IRQ 122 = 3860
+```
+
+Новых `hantro_watchdog` после успешного запуска не было; показанные watchdog'и относились к предыдущему cold-failure до праймера.
+
+Это доказывает, что успешный Cedrus decode-job НЕ требуется.
+
+### 17.6. Важная деталь про codec в минимальном тесте
+
+В одном промежуточном тесте перед Python выполнялось:
+
+```sh
+v4l2-ctl -d /dev/video0 --set-fmt-video-out=width=1920,height=1080,pixelformat=S264
+```
+
+Но `v4l2-ctl` открывает и закрывает собственный file descriptor. Python затем открывал новый `/dev/video0`, то есть создавался новый Cedrus context, и H.264 format туда не переносился.
+
+В `cedrus_open()` новый context вызывает reset output format и выбирает первый доступный source codec. Для обычной конфигурации это MPEG-2. У MPEG-2 `cedrus_dec_ops_mpeg2` не имеет `.start` callback.
+
+Следовательно, успешный STREAMON-only primer не зависел от H.264-specific DMA buffers и не выполнял H.264 start path.
+
+Это дополнительно подтверждает, что достаточно самого реального kernel runtime-PM path Cedrus.
+
+### 17.7. Точная формулировка установленного результата
+
+**Доказано:**
+
+```text
+Cold boot
+  -> Hantro G2 VP9 не выдаёт completion IRQ, watchdog timeout
+  -> один реальный runtime-resume/runtime-suspend Cedrus через V4L2 STREAMON/STREAMOFF
+     без QBUF и без Cedrus IRQ
+  -> Hantro G2 VP9 работает и выдаёт IRQ
+```
+
+**Не доказано:** какой именно скрытый аппаратный side effect внутри runtime-resume Cedrus является первопричиной.
+
+Нельзя утверждать, что найден конкретный "бит" или конкретный clock. Наоборот, ручная имитация известных clocks/reset/MBUS этого эффекта не дала.
+
+Корректная текущая гипотеза: реальный kernel/CCF/reset/runtime-PM путь Cedrus выполняет side effect, необходимый для корректного первого запуска Hantro G2 на H6. Точная низкоуровневая причина пока не локализована.
+
+### 17.8. Upstream Linux source points, использованные при диагностике
+
+Основные файлы upstream Linux:
+
+```text
+drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+drivers/staging/media/sunxi/cedrus/cedrus_video.c
+drivers/staging/media/sunxi/cedrus/cedrus.c
+drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+
+drivers/media/platform/verisilicon/hantro_drv.c
+drivers/media/platform/verisilicon/sunxi_vpu_hw.c
+
+drivers/clk/sunxi-ng/ccu-sun50i-h6.c
+```
+
+Важные факты из исходников:
+
+- Cedrus queues используют `vb2_dma_contig_memops`;
+- Cedrus OUTPUT queue имеет `supports_requests=true`, `requires_requests=true`;
+- `cedrus_start_streaming()` делает `pm_runtime_resume_and_get()`;
+- только реальная queue/request нужна для decode job, но STREAMON сам по себе может вызвать start_streaming;
+- `cedrus_hw_resume()` работает через reset framework и clocks `ahb`, `mod`, `ram`;
+- H6 Hantro G2 имеет clocks `mod`, `bus`, отдельный reset и аппаратный VP9 backend;
+- H6 VP9 reset: CCU offset `0x6cc`, BIT16;
+- Cedrus VE clock/reset: `0x690`/`0x69c`;
+- VP9 clock/reset: `0x6c0`/`0x6cc`;
+- `mbus-ve`: CCU `0x804`, BIT1.
+
+### 17.9. Установленный постоянный workaround
+
+Файл:
+
+```text
+/storage/.config/cedrus-vpu-primer.py
+```
+
+Содержимое:
+
+```python
+#!/usr/bin/python3
+
+import os
+import fcntl
+import struct
+import time
+
+DEV = "/dev/video0"
+
+VIDIOC_REQBUFS   = 0xC0145608
+VIDIOC_STREAMON  = 0x40045612
+VIDIOC_STREAMOFF = 0x40045613
+
+V4L2_BUF_TYPE_VIDEO_OUTPUT = 2
+V4L2_MEMORY_MMAP = 1
+
+REQ_FMT = "=IIIIB3x"
+
+# Wait for Cedrus node after boot.
+for _ in range(100):
+    if os.path.exists(DEV):
+        break
+    time.sleep(0.1)
+else:
+    raise RuntimeError("/dev/video0 did not appear")
+
+fd = os.open(DEV, os.O_RDWR | os.O_NONBLOCK)
+
+try:
+    req = bytearray(struct.pack(
+        REQ_FMT,
+        1,
+        V4L2_BUF_TYPE_VIDEO_OUTPUT,
+        V4L2_MEMORY_MMAP,
+        0,
+        0
+    ))
+
+    fcntl.ioctl(fd, VIDIOC_REQBUFS, req, True)
+
+    count, typ, mem, caps, flags = struct.unpack(REQ_FMT, req)
+
+    if count == 0:
+        raise RuntimeError("Cedrus REQBUFS returned zero buffers")
+
+    qtype = bytearray(struct.pack("=I", V4L2_BUF_TYPE_VIDEO_OUTPUT))
+
+    # Actual Cedrus runtime-PM primer.
+    # No QBUF -> no decode job -> no Cedrus IRQ required.
+    fcntl.ioctl(fd, VIDIOC_STREAMON, qtype, True)
+
+    time.sleep(0.2)
+
+    fcntl.ioctl(fd, VIDIOC_STREAMOFF, qtype, True)
+
+    req = bytearray(struct.pack(
+        REQ_FMT,
+        0,
+        V4L2_BUF_TYPE_VIDEO_OUTPUT,
+        V4L2_MEMORY_MMAP,
+        0,
+        0
+    ))
+
+    fcntl.ioctl(fd, VIDIOC_REQBUFS, req, True)
+
+finally:
+    os.close(fd)
+
+print("Cedrus VPU primer completed")
+```
+
+Права:
+
+```sh
+chmod 0755 /storage/.config/cedrus-vpu-primer.py
+```
+
+Systemd unit:
+
+```text
+/storage/.config/system.d/cedrus-vpu-primer.service
+```
+
+Содержимое:
+
+```ini
+[Unit]
+Description=Prime Allwinner H6 Cedrus VPU for Hantro G2
+Before=kodi.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /storage/.config/cedrus-vpu-primer.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Включение:
+
+```sh
+systemctl daemon-reload
+systemctl enable cedrus-vpu-primer.service
+```
+
+### 17.10. Подтверждение сервиса
+
+Перед финальным reboot сервис был проверен вручную:
+
+```text
+systemctl is-enabled cedrus-vpu-primer.service
+-> enabled
+
+Active: active (exited)
+ExecStart=... (code=exited, status=0/SUCCESS)
+Cedrus VPU primer completed
+```
+
+Фактический journal:
+
+```text
+Starting cedrus-vpu-primer.service...
+Cedrus VPU primer completed
+Finished cedrus-vpu-primer.service.
+```
+
+После нового reboot сервис отработал автоматически до первого тестового видео. Первым видео после boot был напрямую запущен VP9 через YouTube addon, и он **запустился сразу**.
+
+Это является финальным cold-boot подтверждением workaround.
+
+### 17.11. Проверка после будущих обновлений LibreELEC/kernel
+
+После обновления ядра или LibreELEC проверить:
+
+```sh
+systemctl status cedrus-vpu-primer.service --no-pager -l
+journalctl -b -u cedrus-vpu-primer.service --no-pager
+
+grep -Ei '1c0e000|1c00000' /proc/interrupts
+
+dmesg | grep -Ei 'hantro_watchdog|iommu.*fault|page fault' | tail -n 30
+```
+
+Контрольный первый VP9:
+
+```sh
+kodi-send --action="PlayMedia(plugin://plugin.video.youtube/play/?video_id=TEklhVioz7I)"
+```
+
+В рабочем состоянии Hantro IRQ должен расти:
+
+```text
+1c00000.video-codec-g2 / GICv2 122 > 0
+```
+
+Если будущий kernel исправит cold-start самостоятельно, сервис можно будет временно disable и повторить чистый cold test. Не удалять workaround до такого подтверждения.
+
+### 17.12. Что не делать при продолжении этой задачи
+
+- Не отключать DRM PRIME как окончательное решение: software VP9 не обеспечивает нормальный 4K60.
+- Не возвращаться к повторным Kodi restart как к лечению cold Hantro.
+- Не повторять обычный Hantro reset pulse — он уже проверен и не помог.
+- Не повторять обычный IOMMU TLB flush — он уже проверен и не помог.
+- Не считать `mbus-ve` pulse решением — он уже проверен и не помог.
+- Не считать ручную последовательность CCU clock/reset эквивалентом runtime-PM Cedrus — экспериментально это не так.
+- Не считать REQBUFS-only достаточным праймером — экспериментально не помогает.
+- Не связывать проблему с RuTracker/nfqws/Chromium: сетевой стек к decoder cold-start отношения не имеет.
+- Не менять рабочую сетевую конфигурацию при диагностике видео.
+
+### 17.13. Короткий текст для продолжения именно hardware decode
+
+> На Orange Pi 3 / H6 cold-start VP9/Hantro G2 локализован. После cold boot первый VP9 через DRM PRIME висит: `hantro_watchdog`, Hantro IRQ 122 остаётся 0. Исключены Kodi restart, runtime-PM Hantro, reset pulse Hantro, IOMMU TLB flush, persistent MBUS/DRAM/bus-IOMMU clocks, `mbus-ve` pulse, ручная полная Cedrus clocks/reset/MBUS последовательность и Cedrus REQBUFS-only. Доказано, что достаточно одного реального Cedrus V4L2 `REQBUFS -> STREAMON -> STREAMOFF` на OUTPUT без QBUF и без decode job: Cedrus IRQ остаётся 0, после чего Hantro выдаёт IRQ и VP9 работает. Установлен `/storage/.config/cedrus-vpu-primer.py` и `cedrus-vpu-primer.service` с `Before=kodi.service`; сервис enabled, oneshot отрабатывает SUCCESS. После финального cold reboot первым видео был VP9 и он запустился. Точный скрытый side effect Cedrus runtime-PM пока не найден; workaround считается подтверждённым.
